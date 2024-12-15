@@ -4,147 +4,238 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"errors"
-	"github.com/gorilla/schema"
-	"io"
+	"fmt"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
-	"time"
+
+	"github.com/dgrijalva/jwt-go"
 )
 
+type SearchRequestServer struct {
+	Limit      int
+	Offset     int
+	Query      string
+	OrderField string
+	OrderBy    int
+}
+
+type UsersServer struct {
+	Users []UserServer `xml:"row"`
+}
+
+type UserServer struct {
+	ID      int    `xml:"id"`
+	Name    string `xml:"first_name"`
+	Surname string `xml:"last_name"`
+	Age     int    `xml:"age"`
+	About   string `xml:"about"`
+	Gender  string `xml:"gender"`
+}
+
+type UserClient struct {
+	ID     int
+	Name   string
+	Age    int
+	About  string
+	Gender string
+}
+
+type ErrorServer struct {
+	Error string `json:"error"`
+}
+
 const (
-	userTagName   = "row"
 	ageFieldName  = "age"
 	nameFieldName = "name"
 	idFieldName   = "id"
 )
 
 var (
-	database             = "dataset.xml"
-	badOrderFieldMessage = "{" + "\"error\": " + "\"" + ErrorBadOrderField + "\"" + "}"
-	pauseDuration        = time.Second * 2
-	errParsingXMLFailed  = errors.New("failed to parse file")
-	errBadOffsetParam    = errors.New("{\"error\": \"bad offset param\"}")
-	errBadQueryParams    = errors.New("{\"error\": \"bad query params\"}")
+	SecretToken           = []byte("secret")
+	database              = "dataset.xml"
+	errBadOrderFieldParam = errors.New(ErrorBadOrderField)
+	errParsingXMLFailed   = errors.New("failed to parse file")
+	errBadLimitParam      = errors.New("bad limit param")
+	errBadOffsetParam     = errors.New("bad offset param")
+	errBadOrderByParam    = errors.New("bad order_by param")
+	errBadQueryParams     = errors.New("bad query params")
+	errBadAccessToken     = errors.New("bad AccessToken")
 )
 
 func SearchServer(w http.ResponseWriter, r *http.Request) {
 	token := r.Header.Get("AccessToken")
-	if strings.Compare(token, "") == 0 {
+	err := authCheck(token)
+	if err != nil {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	users := make([]User, 0)
-	prms := r.URL.Query()
-	params := new(SearchRequest)
-	decoder := schema.NewDecoder()
-	if err := decoder.Decode(params, prms); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_, err := io.WriteString(w, errBadQueryParams.Error())
-		if err != nil {
+
+	enc := json.NewEncoder(w)
+
+	sendErrorResponse := func(errMsg string, statusCode int) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		Msg := ErrorServer{Error: errMsg}
+		if err = enc.Encode(Msg); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
+	}
+
+	rawParams := r.URL.Query()
+	params, err := parseQueryParams(rawParams)
+	if err != nil {
+		sendErrorResponse(err.Error(), http.StatusBadRequest)
 		return
 	}
-	if params.OrderField != "" && params.OrderField != nameFieldName && params.OrderField != ageFieldName && params.OrderField != idFieldName {
-		w.WriteHeader(http.StatusBadRequest)
-		_, err := io.WriteString(w, badOrderFieldMessage)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
+
+	err = validateQueryParams(params)
+	if err != nil {
+		log.Printf("validateQueryParams: %s\n", err.Error())
+		sendErrorResponse(err.Error(), http.StatusBadRequest)
 		return
 	}
+
 	data, err := os.ReadFile(database)
 	if err != nil {
+		log.Printf("SearchServer: Failed to read %s: %s\n", database, err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	err = parseUsers(data, &users)
+
+	users, err := parseUsers(data)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		io.WriteString(w, err.Error()) //nolint:errcheck
+		log.Printf("parseUsers: %s\n", err.Error())
+		sendErrorResponse(err.Error(), http.StatusInternalServerError)
 		return
 	}
-	users, err = sortUsers(users, *params)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_, err = io.WriteString(w, err.Error())
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-		return
-	}
-	enc := json.NewEncoder(w)
-	if err := enc.Encode(users); err != nil {
+
+	users = processUsers(users, *params)
+
+	w.Header().Set("Content-Type", "application/json")
+	if err = enc.Encode(users); err != nil {
+		log.Printf("SearchServer: Failed to send response: %s\n", err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
-		return
 	}
 }
 
-func parseUsers(data []byte, users *[]User) error {
-	user := User{}
-	xmlData := strings.NewReader(string(data))
-	d := xml.NewDecoder(xmlData)
-	for t, err := d.Token(); t != nil; t, err = d.Token() {
-		if err != nil {
-			return errParsingXMLFailed
-		}
-		if tokenType, ok := t.(xml.StartElement); ok && tokenType.Name.Local == userTagName {
-			err := parseUser(d, &user)
-			if err != nil {
-				return err
-			}
-			*users = append(*users, user)
-		}
+func authCheck(token string) error {
+	hashSecretGetter := func(token *jwt.Token) (interface{}, error) {
+		return SecretToken, nil
 	}
+
+	parsedToken, err := jwt.Parse(token, hashSecretGetter)
+	if err != nil || !parsedToken.Valid {
+		return errBadAccessToken
+	}
+
 	return nil
 }
 
-func parseUser(d *xml.Decoder, user *User) error {
-	for tag, err := d.Token(); tag != nil; tag, err = d.Token() {
-		if err != nil {
-			return errParsingXMLFailed
-		}
-		if tagType, ok := tag.(xml.StartElement); ok {
-			switch tagType.Name.Local {
-			case "id":
-				if err := d.DecodeElement(&user.ID, &tagType); err != nil {
-					return errParsingXMLFailed
-				}
-			case "age":
-				if err := d.DecodeElement(&user.Age, &tagType); err != nil {
-					return errParsingXMLFailed
-				}
-			case "first_name":
-				if err := d.DecodeElement(&user.Name, &tagType); err != nil {
-					return errParsingXMLFailed
-				}
-			case "last_name":
-				surname := ""
-				if err := d.DecodeElement(&surname, &tagType); err != nil {
-					return errParsingXMLFailed
-				}
-				user.Name += " " + surname
-			case "about":
-				if err := d.DecodeElement(&user.About, &tagType); err != nil {
-					return errParsingXMLFailed
-				}
-				user.About = user.About[:len(user.About)-1]
-			case "gender":
-				if err := d.DecodeElement(&user.Gender, &tagType); err != nil {
-					return errParsingXMLFailed
-				}
-			case "favoriteFruit":
-				return nil
-			}
-		}
+func parseQueryParams(rawParams url.Values) (*SearchRequestServer, error) {
+	rawLimit := rawParams.Get("limit")
+	limit, err := strconv.Atoi(rawLimit)
+	if err != nil {
+		return nil, errBadQueryParams
 	}
-	return nil
+
+	rawOffset := rawParams.Get("offset")
+	offset, err := strconv.Atoi(rawOffset)
+	if err != nil {
+		return nil, errBadQueryParams
+	}
+
+	rawOrderBy := rawParams.Get("order_by")
+	orderBy, err := strconv.Atoi(rawOrderBy)
+	if err != nil {
+		return nil, errBadQueryParams
+	}
+
+	return &SearchRequestServer{
+		Limit:      limit,
+		Offset:     offset,
+		Query:      rawParams.Get("query"),
+		OrderField: rawParams.Get("order_field"),
+		OrderBy:    orderBy,
+	}, nil
 }
 
-func sortUsers(users []User, params SearchRequest) ([]User, error) {
-	compareUsersByAge := func(a, b User) int {
+func validateQueryParams(params *SearchRequestServer) error {
+	if params.OrderField != "" && params.OrderField != nameFieldName &&
+		params.OrderField != ageFieldName && params.OrderField != idFieldName {
+		return errBadOrderFieldParam
+	}
+	if params.Limit <= 0 {
+		return errBadLimitParam
+	}
+	if params.Offset < 0 {
+		return errBadOffsetParam
+	}
+	switch params.OrderBy {
+	case -1, 0, 1:
+		return nil
+	default:
+		return errBadOrderByParam
+	}
+}
+
+func parseUsers(data []byte) ([]UserClient, error) {
+	users := UsersServer{}
+	err := xml.Unmarshal(data, &users)
+	if err != nil {
+		return nil, errParsingXMLFailed
+	}
+
+	unexpectedChars := string([]rune{10, 32})
+	parsedUsers := make([]UserClient, 0, len(users.Users))
+	for _, user := range users.Users {
+		parsedUsers = append(parsedUsers, UserClient{
+			ID:     user.ID,
+			Name:   fmt.Sprintf("%s %s", user.Name, user.Surname),
+			Age:    user.Age,
+			About:  strings.TrimRight(user.About, unexpectedChars),
+			Gender: user.Gender,
+		})
+	}
+	return parsedUsers, nil
+}
+
+func processUsers(users []UserClient, params SearchRequestServer) []UserClient {
+	users = filterUsers(users, params.Query)
+	if params.Offset >= len(users) {
+		return []UserClient{}
+	}
+
+	users = sortUsers(users, params.OrderField, params.OrderBy)
+	users = paginateUsers(users, params.Offset, params.Limit)
+	return users
+}
+
+func filterUsers(users []UserClient, query string) []UserClient {
+	if query != "" {
+		users = slices.DeleteFunc(users, func(item UserClient) bool {
+			return !strings.Contains(item.Name, query) && !strings.Contains(item.About, query)
+		})
+	}
+	return users
+}
+
+func sortUsers(users []UserClient, orderField string, orderBy int) []UserClient {
+	sortByFieldAndOrder := func(users []UserClient, order int, sortFunc func(a, b UserClient) int) {
+		if order < 0 {
+			slices.SortStableFunc(users, func(aa, bb UserClient) int {
+				return -sortFunc(aa, bb)
+			})
+		} else {
+			slices.SortStableFunc(users, sortFunc)
+		}
+	}
+
+	compareUsersByAge := func(a, b UserClient) int {
 		if a.Age < b.Age {
 			return -1
 		}
@@ -153,7 +244,8 @@ func sortUsers(users []User, params SearchRequest) ([]User, error) {
 		}
 		return 0
 	}
-	compareUsersByID := func(a, b User) int {
+
+	compareUsersByID := func(a, b UserClient) int {
 		if a.ID < b.ID {
 			return -1
 		}
@@ -162,41 +254,28 @@ func sortUsers(users []User, params SearchRequest) ([]User, error) {
 		}
 		return 0
 	}
-	sortByFieldAndOrder := func(users []User, order int, sortFunc func(a, b User) int) {
-		if order < 0 {
-			slices.SortStableFunc(users, func(aa, bb User) int {
-				return -sortFunc(aa, bb)
-			})
-		} else {
-			slices.SortStableFunc(users, sortFunc)
-		}
-	}
-	if params.Query != "" {
-		users = slices.DeleteFunc(users, func(item User) bool {
-			return !strings.Contains(item.Name, params.Query) && !strings.Contains(item.About, params.Query)
-		})
-	}
-	if params.Offset >= len(users) {
-		return nil, errBadOffsetParam
-	}
-	if params.OrderBy != 0 {
-		switch params.OrderField {
-		case "":
-			fallthrough
-		case nameFieldName:
-			sortByFieldAndOrder(users, params.OrderBy, func(a, b User) int {
+
+	if orderBy != 0 {
+		switch orderField {
+		case "", nameFieldName:
+			sortByFieldAndOrder(users, orderBy, func(a, b UserClient) int {
 				return strings.Compare(a.Name, b.Name)
 			})
 		case ageFieldName:
-			sortByFieldAndOrder(users, params.OrderBy, compareUsersByAge)
+			sortByFieldAndOrder(users, orderBy, compareUsersByAge)
 		case idFieldName:
-			sortByFieldAndOrder(users, params.OrderBy, compareUsersByID)
+			sortByFieldAndOrder(users, orderBy, compareUsersByID)
 		}
 	}
-	if lastUserIdx := params.Offset + params.Limit; lastUserIdx <= len(users) {
-		users = users[params.Offset:lastUserIdx]
+
+	return users
+}
+
+func paginateUsers(users []UserClient, offset, limit int) []UserClient {
+	if lastUserIdx := offset + limit; lastUserIdx <= len(users) {
+		users = users[offset:lastUserIdx]
 	} else {
-		users = users[params.Offset:]
+		users = users[offset:]
 	}
-	return users, nil
+	return users
 }

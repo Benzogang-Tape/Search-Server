@@ -50,12 +50,12 @@ const (
 )
 
 type SearchRequest struct {
-	Limit      int    `schema:"limit"`
-	Offset     int    `schema:"offset"` // Можно учесть после сортировки
-	Query      string `schema:"query"`  // подстрока в 1 из полей
-	OrderField string `schema:"order_field"`
+	Limit      int
+	Offset     int    // Можно учесть после сортировки
+	Query      string // подстрока в 1 из полей
+	OrderField string
 	//  1 по возрастанию, 0 как встретилось, -1 по убыванию
-	OrderBy int `schema:"order_by"`
+	OrderBy int
 }
 
 type SearchClient struct {
